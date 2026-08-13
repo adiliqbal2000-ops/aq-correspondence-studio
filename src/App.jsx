@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from "react";
+ import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   BookOpen,
   FileText,
@@ -13,7 +13,86 @@ import {
   ChevronDown,
   AlertCircle,
   Settings as SettingsIcon,
+  ExternalLink,
+  FolderSearch,
+  LogIn,
+  Clipboard,
+  ListTree,
+  Download,
+  CheckSquare,
+  Square,
+  Paperclip,
 } from "lucide-react";
+import {
+  Document,
+  Paragraph,
+  TextRun,
+  HeadingLevel,
+  Table,
+  TableRow,
+  TableCell,
+  WidthType,
+  ShadingType,
+  AlignmentType,
+  Packer,
+  PageBreak,
+} from "docx";
+import * as pdfjsLib from "pdfjs-dist";
+import pdfjsWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import * as mammoth from "mammoth";
+import { createWorker } from "tesseract.js";
+import JSZip from "jszip";
+import { jsPDF } from "jspdf";
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
+
+// ---------------------------------------------------------------------------
+// Extract text from a locally-selected file (not from Drive — from the
+// device's own file picker). Supports .docx, .pdf, .txt/.md, and images
+// (.jpg/.jpeg/.png/.webp) via on-device OCR.
+// ---------------------------------------------------------------------------
+async function extractTextFromLocalFile(file, onProgress) {
+  const name = file.name.toLowerCase();
+
+  if (name.endsWith(".txt") || name.endsWith(".md")) {
+    return (await file.text()).trim();
+  }
+
+  if (name.endsWith(".docx")) {
+    const arrayBuffer = await file.arrayBuffer();
+    const result = await mammoth.extractRawText({ arrayBuffer });
+    return result.value.trim();
+  }
+
+  if (name.endsWith(".pdf")) {
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    let text = "";
+    const maxPages = Math.min(pdf.numPages, 20);
+    for (let i = 1; i <= maxPages; i++) {
+      if (onProgress) onProgress(`Reading page ${i} of ${maxPages}...`);
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      text += content.items.map((it) => it.str).join(" ") + "\n\n";
+    }
+    return text.trim();
+  }
+
+  if (name.endsWith(".jpg") || name.endsWith(".jpeg") || name.endsWith(".png") || name.endsWith(".webp")) {
+    if (onProgress) onProgress("Running OCR on image (this can take a moment)...");
+    const worker = await createWorker("eng");
+    try {
+      const {
+        data: { text },
+      } = await worker.recognize(file);
+      return text.trim();
+    } finally {
+      await worker.terminate();
+    }
+  }
+
+  throw new Error("Unsupported file type — supported: .pdf, .docx, .txt, .md, .jpg, .png, .webp");
+}
 
 // ---------------------------------------------------------------------------
 // Design tokens (inline, since only core Tailwind utilities are available)
@@ -389,9 +468,11 @@ async function saveDirectory(key, arr) {
 function loadSettings() {
   try {
     const raw = localStorage.getItem(LS_SETTINGS_KEY);
-    return raw ? JSON.parse(raw) : { apiKey: "", model: "claude-sonnet-5" };
+    return raw
+      ? { apiKey: "", model: "claude-sonnet-5", googleClientId: "", ...JSON.parse(raw) }
+      : { apiKey: "", model: "claude-sonnet-5", googleClientId: "" };
   } catch (e) {
-    return { apiKey: "", model: "claude-sonnet-5" };
+    return { apiKey: "", model: "claude-sonnet-5", googleClientId: "" };
   }
 }
 
@@ -605,6 +686,7 @@ export default function App() {
   const [directories, setDirectories] = useState(
     Object.fromEntries(DIRECTORY_FIELDS.map((f) => [f.key, f.seed]))
   );
+  const drive = useGoogleDrive();
 
   // initial load: library + persisted directories
   useEffect(() => {
@@ -703,6 +785,16 @@ export default function App() {
                   {library.length}
                 </span>
               </button>
+              <button
+                onClick={() => setTab("search")}
+                className="flex items-center gap-1.5 rounded px-3 py-1.5 text-sm font-medium transition"
+                style={{
+                  backgroundColor: tab === "search" ? brass : "transparent",
+                  color: tab === "search" ? ink : "#C7CEDB",
+                }}
+              >
+                <FolderSearch size={14} /> Drive Search
+              </button>
             </div>
             <button
               onClick={() => setShowSettings(true)}
@@ -737,8 +829,9 @@ export default function App() {
             onSavedToLibrary={refreshLibrary}
             directories={directories}
             addDirectoryValue={addDirectoryValue}
+            drive={drive}
           />
-        ) : (
+        ) : tab === "library" ? (
           <LibraryTab
             library={library}
             loading={libraryLoading}
@@ -746,6 +839,8 @@ export default function App() {
             directories={directories}
             addDirectoryValue={addDirectoryValue}
           />
+        ) : (
+          <SearchTab drive={drive} />
         )}
       </div>
     </div>
@@ -921,6 +1016,30 @@ function AddLetterModal({ onClose, onSaved, directories, addDirectoryValue }) {
   const [content, setContent] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
+  const [attaching, setAttaching] = useState(false);
+  const [attachProgress, setAttachProgress] = useState("");
+  const [attachedFileName, setAttachedFileName] = useState(null);
+
+  async function handleAttach(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    setError(null);
+    setAttaching(true);
+    setAttachProgress("Reading file...");
+    try {
+      const text = await extractTextFromLocalFile(file, setAttachProgress);
+      setContent(text);
+      setAttachedFileName(file.name);
+      if (!title.trim()) setTitle(file.name.replace(/\.[^.]+$/, ""));
+    } catch (err) {
+      setError(err.message || "Couldn't read that file.");
+    } finally {
+      setAttaching(false);
+      setAttachProgress("");
+      const el = document.getElementById("add-letter-file-input");
+      if (el) el.value = "";
+    }
+  }
 
   async function handleSave() {
     if (!content.trim()) {
@@ -994,12 +1113,44 @@ function AddLetterModal({ onClose, onSaved, directories, addDirectoryValue }) {
             <Field label="Tags" value={tags} onChange={setTags} placeholder="e.g. payment, dispute" />
           </div>
           <div>
-            <label style={{ color: slate, fontSize: "11.5px", fontWeight: 500 }}>Letter text</label>
+            <div className="flex items-center justify-between">
+              <label style={{ color: slate, fontSize: "11.5px", fontWeight: 500 }}>Letter text</label>
+              <div className="flex items-center gap-2">
+                <label
+                  htmlFor="add-letter-file-input"
+                  className="flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium"
+                  style={{ color: brass, opacity: attaching ? 0.6 : 1 }}
+                  title="Attach a .pdf, .docx, .txt, or image file"
+                >
+                  {attaching ? <Loader2 size={12} className="animate-spin" /> : <Paperclip size={12} />}
+                  Attach
+                </label>
+                <input
+                  id="add-letter-file-input"
+                  type="file"
+                  accept=".pdf,.docx,.txt,.md,.jpg,.jpeg,.png,.webp"
+                  onChange={handleAttach}
+                  disabled={attaching}
+                  style={{ position: "absolute", width: "1px", height: "1px", padding: 0, margin: "-1px", overflow: "hidden", clip: "rect(0,0,0,0)", whiteSpace: "nowrap", border: 0 }}
+                />
+              </div>
+            </div>
+            {attaching && (
+              <div className="mt-1 flex items-center gap-1" style={{ color: brass, fontSize: "10.5px" }}>
+                <Loader2 size={10} className="animate-spin" /> {attachProgress}
+              </div>
+            )}
+            {attachedFileName && !attaching && (
+              <div style={{ color: slateLight, fontSize: "10.5px", marginTop: "2px" }}>Loaded from {attachedFileName}</div>
+            )}
             <textarea
               value={content}
-              onChange={(e) => setContent(e.target.value)}
+              onChange={(e) => {
+                setContent(e.target.value);
+                setAttachedFileName(null);
+              }}
               rows={10}
-              placeholder="Paste the full letter text here..."
+              placeholder="Paste the full letter text here, or attach a file above..."
               className="mt-1 w-full rounded-md border px-3 py-2 text-sm outline-none"
               style={{ borderColor: line, fontFamily: "Tinos" }}
             />
@@ -1033,7 +1184,7 @@ function AddLetterModal({ onClose, onSaved, directories, addDirectoryValue }) {
 // ---------------------------------------------------------------------------
 // Draft Tab
 // ---------------------------------------------------------------------------
-function DraftTab({ library, onSavedToLibrary, directories, addDirectoryValue }) {
+function DraftTab({ library, onSavedToLibrary, directories, addDirectoryValue, drive }) {
   const today = new Date();
   const defaultDate = `${String(today.getDate()).padStart(2, "0")}.${String(today.getMonth() + 1).padStart(2, "0")}.${today.getFullYear()}`;
 
@@ -1047,21 +1198,100 @@ function DraftTab({ library, onSavedToLibrary, directories, addDirectoryValue })
   const [refNumber, setRefNumber] = useState("");
   const [date, setDate] = useState(defaultDate);
   const [incomingLetter, setIncomingLetter] = useState("");
+  const [incomingAttaching, setIncomingAttaching] = useState(false);
+  const [incomingAttachProgress, setIncomingAttachProgress] = useState("");
+  const [incomingAttachedFileName, setIncomingAttachedFileName] = useState(null);
+  const [incomingAttachError, setIncomingAttachError] = useState(null);
   const [bullets, setBullets] = useState("");
   const [tone, setTone] = useState("auto");
   const [selectedRefs, setSelectedRefs] = useState([]);
   const [showRefPicker, setShowRefPicker] = useState(false);
+
+  // Drive reference material — searched and selected right here in the Draft tab
+  const [showDrivePicker, setShowDrivePicker] = useState(false);
+  const [driveQuery, setDriveQuery] = useState("");
+  const [driveResults, setDriveResults] = useState([]);
+  const [driveSearching, setDriveSearching] = useState(false);
+  const [driveSearchError, setDriveSearchError] = useState(null);
+  const [driveRefs, setDriveRefs] = useState({}); // { fileId: { name, text, loading, error } }
 
   const [draft, setDraft] = useState("");
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState(null);
   const [copied, setCopied] = useState(false);
   const [savingToLibrary, setSavingToLibrary] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  const [downloadProgress, setDownloadProgress] = useState("");
+  const [downloadError, setDownloadError] = useState(null);
   const [savedNotice, setSavedNotice] = useState(false);
   const [editing, setEditing] = useState(false);
 
   function toggleRef(id) {
     setSelectedRefs((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  }
+
+  async function handleAttachIncoming(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    setIncomingAttachError(null);
+    setIncomingAttaching(true);
+    setIncomingAttachProgress("Reading file...");
+    try {
+      const text = await extractTextFromLocalFile(file, setIncomingAttachProgress);
+      setIncomingLetter(text);
+      setIncomingAttachedFileName(file.name);
+    } catch (err) {
+      setIncomingAttachError(err.message || "Couldn't read that file.");
+    } finally {
+      setIncomingAttaching(false);
+      setIncomingAttachProgress("");
+      const el = document.getElementById("incoming-letter-file-input");
+      if (el) el.value = "";
+    }
+  }
+
+  async function handleDriveSearch() {
+    if (!driveQuery.trim() || !drive.accessToken) return;
+    setDriveSearching(true);
+    setDriveSearchError(null);
+    try {
+      const files = await driveSearch(driveQuery, drive.accessToken);
+      setDriveResults(files);
+    } catch (e) {
+      if (e.status === 401) drive.setAccessToken(null);
+      setDriveSearchError(e.status === 401 ? "Your Drive session expired — please connect again." : e.message || "Search failed.");
+      setDriveResults([]);
+    } finally {
+      setDriveSearching(false);
+    }
+  }
+
+  async function toggleDriveRef(file) {
+    setDriveRefs((prev) => {
+      if (prev[file.id]) {
+        const next = { ...prev };
+        delete next[file.id];
+        return next;
+      }
+      return { ...prev, [file.id]: { name: file.name, fileId: file.id, mimeType: file.mimeType, text: "", loading: true, error: null } };
+    });
+
+    if (driveRefs[file.id]) return; // was already selected — just deselected above
+
+    try {
+      const text = await extractTextFromDriveFile(file, drive.accessToken);
+      setDriveRefs((prev) =>
+        prev[file.id]
+          ? { ...prev, [file.id]: { name: file.name, fileId: file.id, mimeType: file.mimeType, text: text.slice(0, 6000), loading: false, error: null } }
+          : prev
+      );
+    } catch (e) {
+      setDriveRefs((prev) =>
+        prev[file.id]
+          ? { ...prev, [file.id]: { name: file.name, fileId: file.id, mimeType: file.mimeType, text: "", loading: false, error: "Couldn't read this file (only Google Docs, .txt, and .pdf are supported)." } }
+          : prev
+      );
+    }
   }
 
   function makeAdder(key) {
@@ -1081,6 +1311,12 @@ function DraftTab({ library, onSavedToLibrary, directories, addDirectoryValue })
         .filter((e) => selectedRefs.includes(e.id))
         .slice(0, 6)
         .map((e, i) => `EXAMPLE LETTER ${i + 1} (${e.client || "unknown client"} — ${e.project || ""}):\n${e.content.slice(0, 2500)}`)
+        .join("\n\n---\n\n");
+
+      const driveContext = Object.values(driveRefs)
+        .filter((r) => r.text && !r.loading && !r.error)
+        .slice(0, 8)
+        .map((r, i) => `ARCHIVE DOCUMENT ${i + 1} (${r.name}):\n${r.text}`)
         .join("\n\n---\n\n");
 
       const toneNote =
@@ -1113,6 +1349,10 @@ ${toneNote}
 
       const systemPrompt = `${AQ_STYLE_PROFILE}${
         examples ? `\n\nHere are relevant past letters from AQ to calibrate against (match phrasing patterns, structure, and register, but do not copy specific facts/figures from these examples into the new letter):\n\n${examples}` : ""
+      }${
+        driveContext
+          ? `\n\nHere are relevant documents from the project archive (Google Drive) — use these for FACTS: reference numbers, dates, amounts, clause citations, and prior correspondence history. Cite these specifically and accurately where relevant to what AQ wants to say. Do not invent facts not present in these documents or the bullet points:\n\n${driveContext}`
+          : ""
       }`;
 
       const settings = loadSettings();
@@ -1190,6 +1430,63 @@ ${toneNote}
       // ignore
     } finally {
       setSavingToLibrary(false);
+    }
+  }
+
+  async function handleDownloadPackage() {
+    if (!draft) return;
+    setDownloading(true);
+    setDownloadError(null);
+    setDownloadProgress("Building letter document...");
+    try {
+      const safeName = (refNumber || subject || "AQ-Letter").replace(/[\/\\?%*:|"<>]/g, "-").trim() || "AQ-Letter";
+      const letterBlob = await buildLetterDocxBlob(draft, letterhead);
+
+      const attachments = Object.values(driveRefs).filter((r) => !r.loading && !r.error && (r.text || r.mimeType === "application/pdf" || r.mimeType === "application/vnd.google-apps.document"));
+
+      if (attachments.length === 0) {
+        // No reference documents were used — just download the letter itself.
+        const url = URL.createObjectURL(letterBlob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `${safeName}.docx`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        return;
+      }
+
+      const zip = new JSZip();
+      zip.file(`${safeName}.docx`, letterBlob);
+
+      for (let i = 0; i < attachments.length; i++) {
+        const entry = attachments[i];
+        setDownloadProgress(`Preparing attachment ${i + 1} of ${attachments.length}: ${entry.name}`);
+        try {
+          const pdfBytes = await fetchDriveRefAsPdfBytes(entry, drive.accessToken);
+          const safeAttachName = entry.name.replace(/[\/\\?%*:|"<>]/g, "-").replace(/\.[^.]+$/, "");
+          zip.file(`Attachments/${safeAttachName}.pdf`, pdfBytes);
+        } catch (e) {
+          // skip a failed attachment rather than aborting the whole package
+        }
+      }
+
+      setDownloadProgress("Packaging files...");
+      const zipBlob = await zip.generateAsync({ type: "blob" });
+      const url = URL.createObjectURL(zipBlob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${safeName}-package.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setDownloadError(e.message || "Couldn't build the download. Please try again.");
+    } finally {
+      setDownloading(false);
+      setDownloadProgress("");
     }
   }
 
@@ -1322,12 +1619,49 @@ ${toneNote}
           <SectionLabel>Content</SectionLabel>
           <div className="mt-2 space-y-3">
             <div>
-              <label style={{ color: slate, fontSize: "11.5px", fontWeight: 500 }}>Incoming letter (optional)</label>
+              <div className="flex items-center justify-between">
+                <label style={{ color: slate, fontSize: "11.5px", fontWeight: 500 }}>Incoming letter (optional)</label>
+                <div className="flex items-center gap-2">
+                  <label
+                    htmlFor="incoming-letter-file-input"
+                    className="flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium"
+                    style={{ color: brass, opacity: incomingAttaching ? 0.6 : 1 }}
+                    title="Attach a .pdf, .docx, .txt, or image file"
+                  >
+                    {incomingAttaching ? <Loader2 size={12} className="animate-spin" /> : <Paperclip size={12} />}
+                    Attach
+                  </label>
+                  <input
+                    id="incoming-letter-file-input"
+                    type="file"
+                    accept=".pdf,.docx,.txt,.md,.jpg,.jpeg,.png,.webp"
+                    onChange={handleAttachIncoming}
+                    disabled={incomingAttaching}
+                    style={{ position: "absolute", width: "1px", height: "1px", padding: 0, margin: "-1px", overflow: "hidden", clip: "rect(0,0,0,0)", whiteSpace: "nowrap", border: 0 }}
+                  />
+                </div>
+              </div>
+              {incomingAttaching && (
+                <div className="mt-1 flex items-center gap-1" style={{ color: brass, fontSize: "10.5px" }}>
+                  <Loader2 size={10} className="animate-spin" /> {incomingAttachProgress}
+                </div>
+              )}
+              {incomingAttachedFileName && !incomingAttaching && (
+                <div style={{ color: slateLight, fontSize: "10.5px", marginTop: "2px" }}>Loaded from {incomingAttachedFileName}</div>
+              )}
+              {incomingAttachError && (
+                <div className="mt-1 flex items-center gap-1" style={{ color: maroon, fontSize: "10.5px" }}>
+                  <AlertCircle size={10} /> {incomingAttachError}
+                </div>
+              )}
               <textarea
                 value={incomingLetter}
-                onChange={(e) => setIncomingLetter(e.target.value)}
+                onChange={(e) => {
+                  setIncomingLetter(e.target.value);
+                  setIncomingAttachedFileName(null);
+                }}
                 rows={4}
-                placeholder="Paste the letter being replied to, if any..."
+                placeholder="Paste the letter being replied to, or attach a file above..."
                 className="mt-1 w-full rounded-md border px-3 py-2 text-sm outline-none"
                 style={{ borderColor: line, fontFamily: "Tinos" }}
               />
@@ -1404,6 +1738,84 @@ ${toneNote}
           </div>
         </div>
 
+        <div className="rounded-lg border bg-white p-4 shadow-sm" style={{ borderColor: line }}>
+          <SectionLabel>Reference from Google Drive</SectionLabel>
+          <p style={{ color: slateLight, fontSize: "11px", marginTop: "2px", marginBottom: "8px" }}>
+            Pull facts, reference numbers, and prior correspondence directly from your project archive.
+          </p>
+
+          {!drive.clientId ? (
+            <div style={{ color: slateLight, fontSize: "11.5px" }}>
+              Set up a Google OAuth Client ID in Settings to enable this.
+            </div>
+          ) : !drive.accessToken ? (
+            <button
+              onClick={drive.connect}
+              disabled={drive.connecting}
+              className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium"
+              style={{ borderColor: brass, color: brass, opacity: drive.connecting ? 0.7 : 1 }}
+            >
+              {drive.connecting ? <Loader2 size={13} className="animate-spin" /> : <FolderSearch size={13} />}
+              {drive.connecting ? "Connecting..." : "Connect Google Drive"}
+            </button>
+          ) : (
+            <>
+              <div className="flex gap-2">
+                <input
+                  value={driveQuery}
+                  onChange={(e) => setDriveQuery(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleDriveSearch()}
+                  placeholder="Search the archive..."
+                  className="flex-1 rounded-md border px-3 py-2 text-sm outline-none"
+                  style={{ borderColor: line }}
+                />
+                <button
+                  onClick={handleDriveSearch}
+                  disabled={driveSearching || !driveQuery.trim()}
+                  className="flex items-center gap-1 rounded-md px-3 py-2 text-xs font-medium text-white"
+                  style={{ backgroundColor: ink, opacity: driveSearching || !driveQuery.trim() ? 0.7 : 1 }}
+                >
+                  {driveSearching ? <Loader2 size={13} className="animate-spin" /> : <Search size={13} />}
+                </button>
+              </div>
+
+              {driveSearchError && (
+                <div className="mt-2 flex items-center gap-1" style={{ color: maroon, fontSize: "11px" }}>
+                  <AlertCircle size={11} /> {driveSearchError}
+                </div>
+              )}
+
+              {driveResults.length > 0 && (
+                <div className="mt-2 max-h-40 space-y-1 overflow-y-auto rounded-md border p-2" style={{ borderColor: line }}>
+                  {driveResults.map((f) => (
+                    <label key={f.id} className="flex cursor-pointer items-start gap-2 rounded px-1.5 py-1 text-xs hover:bg-gray-50">
+                      <input type="checkbox" checked={!!driveRefs[f.id]} onChange={() => toggleDriveRef(f)} className="mt-0.5" />
+                      <span style={{ color: charcoal }}>{f.name}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
+
+              {Object.keys(driveRefs).length > 0 && (
+                <div className="mt-2 space-y-1">
+                  {Object.entries(driveRefs).map(([id, r]) => (
+                    <div key={id} className="flex items-center gap-1.5 rounded px-2 py-1" style={{ backgroundColor: "#FBF3E4", fontSize: "11px" }}>
+                      {r.loading ? (
+                        <Loader2 size={11} className="animate-spin" style={{ color: brass }} />
+                      ) : r.error ? (
+                        <AlertCircle size={11} style={{ color: maroon }} />
+                      ) : (
+                        <Check size={11} style={{ color: "#3E7D52" }} />
+                      )}
+                      <span style={{ color: r.error ? maroon : brass, flex: 1 }}>{r.name}{r.error ? ` — ${r.error}` : ""}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
         {error && (
           <div className="flex items-center gap-1.5 rounded-md border px-3 py-2" style={{ borderColor: maroon, color: maroon, fontSize: "12px" }}>
             <AlertCircle size={13} /> {error}
@@ -1423,10 +1835,10 @@ ${toneNote}
 
       {/* Preview panel */}
       <div className="lg:col-span-3">
-        <div className="mb-2 flex items-center justify-between">
+        <div className="mb-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <SectionLabel>Preview</SectionLabel>
           {draft && (
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               <button
                 onClick={() => setEditing((v) => !v)}
                 className="rounded-md border px-2.5 py-1 text-xs font-medium"
@@ -1441,7 +1853,21 @@ ${toneNote}
                 style={{ borderColor: line, color: slate }}
               >
                 {savedNotice ? <Check size={12} /> : <BookOpen size={12} />}
-                {savedNotice ? "Saved" : "Save to library"}
+                {savedNotice ? "Saved" : "Save"}
+              </button>
+              <button
+                onClick={handleDownloadPackage}
+                disabled={downloading}
+                className="flex items-center gap-1 rounded-md border px-2.5 py-1 text-xs font-medium"
+                style={{ borderColor: brass, color: brass, backgroundColor: "#FBF3E4", opacity: downloading ? 0.7 : 1 }}
+                title={
+                  Object.values(driveRefs).some((r) => !r.loading && !r.error)
+                    ? "Download the letter as .docx, bundled with reference documents as PDF attachments in a .zip"
+                    : "Download the letter as a .docx file"
+                }
+              >
+                {downloading ? <Loader2 size={12} className="animate-spin" /> : <Download size={12} />}
+                {downloading ? downloadProgress || "Preparing..." : Object.values(driveRefs).some((r) => !r.loading && !r.error) ? "Download package" : "Download .docx"}
               </button>
               <button
                 onClick={handleCopy}
@@ -1454,6 +1880,12 @@ ${toneNote}
             </div>
           )}
         </div>
+
+        {downloadError && (
+          <div className="mb-2 flex items-center gap-1.5 rounded-md border px-3 py-2" style={{ borderColor: maroon, color: maroon, fontSize: "12px" }}>
+            <AlertCircle size={13} /> {downloadError}
+          </div>
+        )}
 
         <div
           className="rounded-md p-8 shadow-lg"
@@ -1503,10 +1935,15 @@ function SettingsModal({ onClose }) {
   const initial = loadSettings();
   const [apiKey, setApiKey] = useState(initial.apiKey || "");
   const [model, setModel] = useState(initial.model || "claude-sonnet-5");
+  const [googleClientId, setGoogleClientId] = useState(initial.googleClientId || "");
   const [saved, setSaved] = useState(false);
 
   function handleSave() {
-    saveSettings({ apiKey: apiKey.trim(), model: model.trim() || "claude-sonnet-5" });
+    saveSettings({
+      apiKey: apiKey.trim(),
+      model: model.trim() || "claude-sonnet-5",
+      googleClientId: googleClientId.trim(),
+    });
     setSaved(true);
     setTimeout(() => {
       setSaved(false);
@@ -1517,7 +1954,7 @@ function SettingsModal({ onClose }) {
   return (
     <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
       <div
-        className="w-full max-w-md rounded-lg bg-white p-5 shadow-xl"
+        className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-lg bg-white p-5 shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-4 flex items-center justify-between">
@@ -1561,6 +1998,24 @@ function SettingsModal({ onClose }) {
               Defaults to claude-sonnet-5. Change only if you know the exact model ID you want.
             </p>
           </div>
+
+          <div className="border-t pt-3" style={{ borderColor: line }}>
+            <label style={{ color: slate, fontSize: "11.5px", fontWeight: 500 }}>Google OAuth Client ID (for Drive Search)</label>
+            <input
+              value={googleClientId}
+              onChange={(e) => setGoogleClientId(e.target.value)}
+              placeholder="xxxxxxxx.apps.googleusercontent.com"
+              className="mt-1 w-full rounded-md border px-3 py-2 text-sm outline-none"
+              style={{ borderColor: line, fontFamily: "JetBrains Mono" }}
+            />
+            <p style={{ color: slateLight, fontSize: "11px", marginTop: "4px" }}>
+              Only needed for the Drive Search tab. Create one at{" "}
+              <a href="https://console.cloud.google.com" target="_blank" rel="noreferrer" style={{ color: brass }}>
+                console.cloud.google.com
+              </a>{" "}
+              — see the README for exact steps.
+            </p>
+          </div>
         </div>
 
         <div className="mt-5 flex justify-end gap-2">
@@ -1588,3 +2043,313 @@ function SectionLabel({ children }) {
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Drive Search — client-side Google OAuth + Drive full-text search.
+// No backend server required: uses Google Identity Services' token client,
+// which is designed for pure front-end apps. The access token lives only in
+// memory (React state) and is never persisted to disk.
+// ---------------------------------------------------------------------------
+const DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.readonly";
+
+function loadGoogleIdentityScript() {
+  return new Promise((resolve, reject) => {
+    if (window.google && window.google.accounts && window.google.accounts.oauth2) {
+      resolve();
+      return;
+    }
+    const existing = document.getElementById("google-identity-script");
+    if (existing) {
+      existing.addEventListener("load", () => resolve());
+      existing.addEventListener("error", () => reject(new Error("Failed to load Google script")));
+      return;
+    }
+    const script = document.createElement("script");
+    script.id = "google-identity-script";
+    script.src = "https://accounts.google.com/gsi/client";
+    script.async = true;
+    script.defer = true;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error("Failed to load Google script"));
+    document.head.appendChild(script);
+  });
+}
+
+// Single shared Google Drive connection — call this once in App and pass the
+// result down to any tab that needs Drive access, so signing in once works
+// everywhere in the app instead of needing to reconnect per-tab.
+function useGoogleDrive() {
+  const settings = loadSettings();
+  const clientId = settings.googleClientId || "";
+
+  const [scriptReady, setScriptReady] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const [accessToken, setAccessToken] = useState(null);
+  const [connectError, setConnectError] = useState(null);
+  const tokenClientRef = useRef(null);
+
+  useEffect(() => {
+    if (!clientId) return;
+    loadGoogleIdentityScript()
+      .then(() => setScriptReady(true))
+      .catch(() => setConnectError("Couldn't load Google's sign-in script. Check your internet connection."));
+  }, [clientId]);
+
+  function connect() {
+    if (!scriptReady || !window.google) {
+      setConnectError("Google's sign-in script hasn't loaded yet — try again in a moment.");
+      return;
+    }
+    setConnecting(true);
+    setConnectError(null);
+    try {
+      if (!tokenClientRef.current) {
+        tokenClientRef.current = window.google.accounts.oauth2.initTokenClient({
+          client_id: clientId,
+          scope: DRIVE_SCOPE,
+          callback: (response) => {
+            setConnecting(false);
+            if (response && response.access_token) {
+              setAccessToken(response.access_token);
+            } else {
+              setConnectError("Sign-in didn't return an access token. Please try again.");
+            }
+          },
+          error_callback: () => {
+            setConnecting(false);
+            setConnectError("Sign-in was cancelled or failed.");
+          },
+        });
+      }
+      tokenClientRef.current.requestAccessToken();
+    } catch (e) {
+      setConnecting(false);
+      setConnectError("Couldn't start Google sign-in. Check your Client ID in Settings.");
+    }
+  }
+
+  return { clientId, accessToken, setAccessToken, connecting, connectError, scriptReady, connect };
+}
+
+function formatDate(iso) {
+  if (!iso) return "";
+  try {
+    const d = new Date(iso);
+    return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  } catch (e) {
+    return iso;
+  }
+}
+
+async function extractTextFromDriveFile(file, accessToken) {
+  if (file.mimeType === "application/vnd.google-apps.document") {
+    const res = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}/export?mimeType=text/plain`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) throw new Error("export failed");
+    return await res.text();
+  }
+  if (file.mimeType === "text/plain" || file.mimeType === "text/markdown") {
+    const res = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) throw new Error("download failed");
+    return await res.text();
+  }
+  if (file.mimeType === "application/pdf") {
+    const res = await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) throw new Error("download failed");
+    const arrayBuffer = await res.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    let text = "";
+    const maxPages = Math.min(pdf.numPages, 15);
+    for (let i = 1; i <= maxPages; i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      text += content.items.map((it) => it.str).join(" ") + "\n\n";
+    }
+    return text.trim();
+  }
+  throw new Error("unsupported file type");
+}
+
+async function driveSearch(query, accessToken) {
+  const escaped = query.trim().replace(/'/g, "\\'");
+  const q = `(fullText contains '${escaped}' or name contains '${escaped}') and trashed = false`;
+  const params = new URLSearchParams({
+    q,
+    fields: "files(id,name,mimeType,webViewLink,modifiedTime)",
+    pageSize: "30",
+    orderBy: "modifiedTime desc",
+  });
+  const response = await fetch(`https://www.googleapis.com/drive/v3/files?${params.toString()}`, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    const err = new Error(body?.error?.message || `Search failed (${response.status})`);
+    err.status = response.status;
+    throw err;
+  }
+  const data = await response.json();
+  return data.files || [];
+}
+
+const DRIVE_FOLDER_MIME = "application/vnd.google-apps.folder";
+
+// Fetches ALL children of a folder — folders and files separately — paging
+// through the full result set rather than capping at 30 like search does.
+// This matters for "give me the complete project folder" use cases.
+async function driveListChildren(folderId, accessToken) {
+  let allFiles = [];
+  let pageToken = null;
+  do {
+    const params = new URLSearchParams({
+      q: `'${folderId}' in parents and trashed = false`,
+      fields: "nextPageToken, files(id,name,mimeType,webViewLink,modifiedTime)",
+      pageSize: "1000",
+      orderBy: "folder,name",
+    });
+    if (pageToken) params.set("pageToken", pageToken);
+    const response = await fetch(`https://www.googleapis.com/drive/v3/files?${params.toString()}`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      const err = new Error(body?.error?.message || `Couldn't list folder (${response.status})`);
+      err.status = response.status;
+      throw err;
+    }
+    const data = await response.json();
+    allFiles = allFiles.concat(data.files || []);
+    pageToken = data.nextPageToken || null;
+  } while (pageToken);
+
+  return {
+    folders: allFiles.filter((f) => f.mimeType === DRIVE_FOLDER_MIME),
+    files: allFiles.filter((f) => f.mimeType !== DRIVE_FOLDER_MIME),
+  };
+}
+
+// Recursively walks a folder and all its subfolders, collecting every file.
+// Used for "select entire project folder" — reports the running count via
+// onProgress since deep archives can take a few seconds.
+async function driveListAllFilesRecursive(folderId, accessToken, onProgress, depth = 0, seen = { folders: 0, files: [] }) {
+  if (depth > 8) return seen.files; // safety cap against unexpectedly deep/circular structures
+  const { folders, files } = await driveListChildren(folderId, accessToken);
+  seen.folders += 1;
+  seen.files.push(...files);
+  if (onProgress) onProgress(`Scanned ${seen.folders} folder${seen.folders === 1 ? "" : "s"}, found ${seen.files.length} file${seen.files.length === 1 ? "" : "s"} so far...`);
+  for (const folder of folders) {
+    await driveListAllFilesRecursive(folder.id, accessToken, onProgress, depth + 1, seen);
+  }
+  return seen.files;
+}
+
+// ---------------------------------------------------------------------------
+// Turn a reference document (used as evidence/enclosure for a drafted
+// letter) into PDF bytes, so it can be bundled alongside the letter as a
+// real attachment — regardless of what format it originally was in Drive.
+// ---------------------------------------------------------------------------
+async function fetchDriveRefAsPdfBytes(entry, accessToken) {
+  // Already a PDF — just download the original bytes as-is.
+  if (entry.mimeType === "application/pdf") {
+    const res = await fetch(`https://www.googleapis.com/drive/v3/files/${entry.fileId}?alt=media`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) throw new Error("download failed");
+    return await res.arrayBuffer();
+  }
+  // A Google Doc — Drive can export it straight to PDF natively.
+  if (entry.mimeType === "application/vnd.google-apps.document") {
+    const res = await fetch(`https://www.googleapis.com/drive/v3/files/${entry.fileId}/export?mimeType=application/pdf`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (!res.ok) throw new Error("export failed");
+    return await res.arrayBuffer();
+  }
+  // Plain text/markdown — no native PDF form, so generate a simple one from
+  // the text we already extracted.
+  if (entry.text) {
+    const pdf = new jsPDF({ unit: "pt", format: "a4" });
+    const margin = 48;
+    const maxWidth = 595 - margin * 2;
+    pdf.setFontSize(11);
+    const lines = pdf.splitTextToSize(entry.text, maxWidth);
+    let y = margin;
+    const lineHeight = 14;
+    for (const line of lines) {
+      if (y > 800) {
+        pdf.addPage();
+        y = margin;
+      }
+      pdf.text(line, margin, y);
+      y += lineHeight;
+    }
+    return pdf.output("arraybuffer");
+  }
+  throw new Error("no content available to convert");
+}
+
+// Builds the drafted letter itself as a proper .docx, with a simple
+// letterhead header matching the app's branding.
+async function buildLetterDocxBlob(draftText, letterheadType) {
+  const NAVY = "1B2A44";
+  const BRASS = "A9803F";
+  const SLATE = "5B6472";
+
+  const headerLines =
+    letterheadType === "consortium"
+      ? [
+          { text: "ATL – GPL CONSORTIUM", bold: true, size: 30, color: NAVY },
+        ]
+      : [
+          { text: "AL-TARIQ CONSTRUCTORS (PVT.) LTD.", bold: true, size: 26, color: NAVY },
+          {
+            text: "Suite: 1301-1302, 13th Floor, Uni Centre, I.I Chundrigar Road, Karachi - 74000, Pakistan.  Tel: 0092-21-3242-7800, 3242-7820",
+            size: 17,
+            color: SLATE,
+          },
+        ];
+
+  const headerParagraphs = headerLines.map(
+    (l) =>
+      new Paragraph({
+        spacing: { after: 60 },
+        children: [new TextRun({ text: l.text, bold: !!l.bold, size: l.size, color: l.color })],
+      })
+  );
+
+  const bodyParagraphs = draftText.split(/\n/).map(
+    (line) =>
+      new Paragraph({
+        spacing: { after: line.trim() === "" ? 120 : 40 },
+        children: [new TextRun({ text: line, size: 22 })],
+      })
+  );
+
+  const doc = new Document({
+    sections: [
+      {
+        properties: { page: { margin: { top: 900, bottom: 900, left: 1000, right: 1000 } } },
+        children: [
+          ...headerParagraphs,
+          new Paragraph({ border: { bottom: { color: BRASS, space: 4, style: "single", size: 8 } }, spacing: { after: 240 } }),
+          ...bodyParagraphs,
+        ],
+      },
+    ],
+  });
+
+  return await Packer.toBlob(doc);
+}
+
+// ---------------------------------------------------------------------------
+// Report Builder — one flexible engine behind several report types.
+// Each type just changes the instructions given to Claude; the output shape
+// (a list of sections: heading / paragraph / bullets / table) is always the
+// same, so one renderer and one docx exporter handle every report type.
+// ---------------------------------------------------------------------------
+c               
