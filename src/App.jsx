@@ -2356,4 +2356,844 @@ async function buildLetterDocxBlob(draftText, letterheadType) {
     (line) =>
       new Paragraph({
         spacing: { after: line.trim() === "" ? 120 : 40 },
-        children: [new TextRun({ text: line, size: 2
+        children: [new TextRun({ text: line, size: 22 })],
+      })
+  );
+
+  const doc = new Document({
+    sections: [
+      {
+        properties: { page: { margin: { top: 900, bottom: 900, left: 1000, right: 1000 } } },
+        children: [
+          ...headerParagraphs,
+          new Paragraph({ border: { bottom: { color: BRASS, space: 4, style: "single", size: 8 } }, spacing: { after: 240 } }),
+          ...bodyParagraphs,
+        ],
+      },
+    ],
+  });
+
+  return await Packer.toBlob(doc);
+}
+
+// ---------------------------------------------------------------------------
+// Report Builder — one flexible engine behind several report types.
+// Each type just changes the instructions given to Claude; the output shape
+// (a list of sections: heading / paragraph / bullets / table) is always the
+// same, so one renderer and one docx exporter handle every report type.
+// ---------------------------------------------------------------------------
+const REPORT_TYPES = [
+  {
+    id: "chronology",
+    label: "Full Chronology",
+    instructions:
+      "Build a clear, dated chronological timeline of events from these documents. Use a single table section (columns: Date, Reference No., From → To, Description) as the main content, sorted chronologically. Mark the handful of most important documents by starting their description with \"KEY EVIDENCE:\". Follow the table with a short paragraph identifying the central dispute or contradiction in the record, if any, and a bullet list of specific gaps or things worth verifying.",
+  },
+  {
+    id: "project-summary",
+    label: "Project Summary",
+    instructions:
+      "Write a project summary covering: project scope and objective, key parties and their roles, current status, major milestones reached, and any outstanding issues or risks. Use headings to organize it (Overview, Key Parties, Status, Outstanding Issues), with paragraphs and bullet lists as appropriate. Include a brief reference table of key dates/documents only if it adds clarity.",
+  },
+  {
+    id: "executive-summary",
+    label: "Executive Summary",
+    instructions:
+      "Write a concise executive summary suitable for a busy Chief Executive to read in under two minutes: a short paragraph on what this is about, then a bullet list of the 4-6 most important facts or developments, then a short paragraph on recommended next steps or decisions needed. No long tables — keep it tight and high-level.",
+  },
+  {
+    id: "financial-summary",
+    label: "Financial Summary",
+    instructions:
+      "Write a financial summary of this project/dispute: all amounts claimed, verified, paid, or outstanding, with their sources (which letter/document each figure comes from). Use a table (columns: Item, Amount, Status, Source Reference) as the main content, followed by a short paragraph reconciling or explaining any figures that appear inconsistent across documents, and a bullet list of amounts that need clarification.",
+  },
+  {
+    id: "status-report",
+    label: "Status Report",
+    instructions:
+      "Write a current status report: what has happened most recently, what the current state of the matter is, and what the recommended next steps are. Use headings (Recent Developments, Current Status, Next Steps), with paragraphs and bullet lists. Keep it grounded strictly in what the documents show — do not speculate about outcomes.",
+  },
+];
+
+function SearchTab({ drive }) {
+  const { clientId, accessToken, connecting, connectError, scriptReady, connect, setAccessToken } = drive;
+
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState([]);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState(null);
+  const [searched, setSearched] = useState(false);
+
+  const [mode, setMode] = useState("search"); // "search" | "browse"
+  const [browsePath, setBrowsePath] = useState([{ id: "root", name: "My Drive" }]);
+  const [browseFolders, setBrowseFolders] = useState([]);
+  const [browseFiles, setBrowseFiles] = useState([]);
+  const [browseLoading, setBrowseLoading] = useState(false);
+  const [browseError, setBrowseError] = useState(null);
+  const [recursiveLoading, setRecursiveLoading] = useState(false);
+  const [recursiveProgress, setRecursiveProgress] = useState("");
+
+  const [previewFile, setPreviewFile] = useState(null);
+  const [previewText, setPreviewText] = useState("");
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState(null);
+  const [previewCopied, setPreviewCopied] = useState(false);
+
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const [building, setBuilding] = useState(false);
+  const [buildProgress, setBuildProgress] = useState("");
+  const [buildError, setBuildError] = useState(null);
+  const [report, setReport] = useState(null);
+  const [reportTypeId, setReportTypeId] = useState("chronology");
+  const [customInstructions, setCustomInstructions] = useState("");
+
+  async function handleSearch() {
+    if (!query.trim() || !accessToken) return;
+    setSearching(true);
+    setSearchError(null);
+    setSearched(true);
+    try {
+      const files = await driveSearch(query, accessToken);
+      setResults(files);
+    } catch (e) {
+      if (e.status === 401) setAccessToken(null);
+      setSearchError(e.status === 401 ? "Your Drive session expired — please connect again." : e.message || "Search failed. Please try again.");
+      setResults([]);
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  async function handlePreview(file) {
+    setPreviewFile(file);
+    setPreviewText("");
+    setPreviewError(null);
+    setPreviewLoading(true);
+    try {
+      let url;
+      if (file.mimeType === "application/vnd.google-apps.document") {
+        url = `https://www.googleapis.com/drive/v3/files/${file.id}/export?mimeType=text/plain`;
+      } else if (file.mimeType === "text/plain" || file.mimeType === "text/markdown") {
+        url = `https://www.googleapis.com/drive/v3/files/${file.id}?alt=media`;
+      } else {
+        setPreviewError(
+          "This file type can't be previewed as text here (only Google Docs and .txt files can). Use \"Open in Drive\" instead, then copy the text manually."
+        );
+        setPreviewLoading(false);
+        return;
+      }
+      const response = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+      if (!response.ok) throw new Error(`Couldn't load file content (${response.status})`);
+      const text = await response.text();
+      setPreviewText(text);
+    } catch (e) {
+      setPreviewError(e.message || "Couldn't load this file's content.");
+    } finally {
+      setPreviewLoading(false);
+    }
+  }
+
+  async function handleCopyPreview() {
+    try {
+      await navigator.clipboard.writeText(previewText);
+      setPreviewCopied(true);
+      setTimeout(() => setPreviewCopied(false), 1800);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  function toggleSelect(id) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  async function loadFolder(folderId) {
+    setBrowseLoading(true);
+    setBrowseError(null);
+    try {
+      const { folders, files } = await driveListChildren(folderId, accessToken);
+      setBrowseFolders(folders);
+      setBrowseFiles(files);
+    } catch (e) {
+      if (e.status === 401) setAccessToken(null);
+      setBrowseError(e.status === 401 ? "Your Drive session expired — please connect again." : e.message || "Couldn't load this folder.");
+      setBrowseFolders([]);
+      setBrowseFiles([]);
+    } finally {
+      setBrowseLoading(false);
+    }
+  }
+
+  function enterBrowseMode() {
+    setMode("browse");
+    if (browseFolders.length === 0 && browseFiles.length === 0) {
+      loadFolder(browsePath[browsePath.length - 1].id);
+    }
+  }
+
+  function navigateInto(folder) {
+    const nextPath = [...browsePath, { id: folder.id, name: folder.name }];
+    setBrowsePath(nextPath);
+    loadFolder(folder.id);
+  }
+
+  function navigateToBreadcrumb(index) {
+    const nextPath = browsePath.slice(0, index + 1);
+    setBrowsePath(nextPath);
+    loadFolder(nextPath[nextPath.length - 1].id);
+  }
+
+  function ensureInResultsAndSelect(files) {
+    setResults((prev) => {
+      const existingIds = new Set(prev.map((f) => f.id));
+      const additions = files.filter((f) => !existingIds.has(f.id));
+      return [...prev, ...additions];
+    });
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      files.forEach((f) => next.add(f.id));
+      return next;
+    });
+  }
+
+  function toggleBrowseFile(file) {
+    if (selectedIds.has(file.id)) {
+      toggleSelect(file.id);
+    } else {
+      ensureInResultsAndSelect([file]);
+    }
+  }
+
+  function handleSelectAllCurrentFolder() {
+    ensureInResultsAndSelect(browseFiles);
+  }
+
+  async function handleSelectAllRecursive() {
+    const currentFolder = browsePath[browsePath.length - 1];
+    setRecursiveLoading(true);
+    setRecursiveProgress("Starting scan...");
+    setBrowseError(null);
+    try {
+      const allFiles = await driveListAllFilesRecursive(currentFolder.id, accessToken, setRecursiveProgress);
+      ensureInResultsAndSelect(allFiles);
+    } catch (e) {
+      if (e.status === 401) setAccessToken(null);
+      setBrowseError(e.status === 401 ? "Your Drive session expired — please connect again." : e.message || "Couldn't scan this folder.");
+    } finally {
+      setRecursiveLoading(false);
+      setRecursiveProgress("");
+    }
+  }
+
+
+  async function handleBuildReport() {
+    const settings = loadSettings();
+    if (!settings.apiKey) {
+      setBuildError("Add your Anthropic API key in Settings before building a report.");
+      return;
+    }
+    const selectedFiles = results.filter((f) => selectedIds.has(f.id));
+    if (selectedFiles.length === 0) return;
+
+    const reportType = REPORT_TYPES.find((t) => t.id === reportTypeId) || REPORT_TYPES[0];
+    const instructions = reportTypeId === "custom" ? customInstructions.trim() : reportType.instructions;
+    if (reportTypeId === "custom" && !instructions) {
+      setBuildError("Describe what kind of report you want before building it.");
+      return;
+    }
+
+    setBuilding(true);
+    setBuildError(null);
+    setReport(null);
+
+    try {
+      const extracted = [];
+      const skipped = [];
+      for (let i = 0; i < selectedFiles.length; i++) {
+        const f = selectedFiles[i];
+        setBuildProgress(`Reading file ${i + 1} of ${selectedFiles.length}: ${f.name}`);
+        try {
+          const text = await extractTextFromDriveFile(f, accessToken);
+          extracted.push({ name: f.name, modified: f.modifiedTime, text: text.slice(0, 6000) });
+        } catch (e) {
+          skipped.push(f.name);
+        }
+      }
+
+      if (extracted.length === 0) {
+        throw new Error("Couldn't extract text from any of the selected files.");
+      }
+
+      setBuildProgress("Analyzing and writing the report...");
+
+      const combined = extracted
+        .map((e, i) => `--- FILE ${i + 1}: ${e.name} (modified ${e.modified || "unknown"}) ---\n${e.text}`)
+        .join("\n\n");
+
+      const systemPrompt = `You analyze construction/EPC contract correspondence and project documents to produce clear, accurate reports. You only state what is directly supported by the provided documents — never invent dates, amounts, reference numbers, or facts. If something is unclear or missing, say so rather than guessing.
+
+TASK: ${instructions}
+
+Respond ONLY with valid JSON (no markdown fences, no commentary) matching exactly this shape:
+{
+  "title": "short descriptive title for this report",
+  "sections": [
+    { "type": "heading", "text": "Section Heading" },
+    { "type": "paragraph", "text": "..." },
+    { "type": "bullets", "items": ["...", "..."] },
+    { "type": "table", "headers": ["Col A", "Col B"], "rows": [["...", "..."]] }
+  ]
+}
+Use whichever section types fit the task best and in whatever order makes sense — you don't need to use every type. Keep it well-organized and skimmable.`;
+
+      const userPrompt = `Build the report from the following documents:\n\n${combined}`;
+
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": settings.apiKey,
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: settings.model || "claude-sonnet-5",
+          max_tokens: 4000,
+          system: systemPrompt,
+          messages: [{ role: "user", content: userPrompt }],
+        }),
+      });
+
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body?.error?.message || `Request failed (${response.status})`);
+      }
+
+      const data = await response.json();
+      const text = (data.content || [])
+        .filter((b) => b.type === "text")
+        .map((b) => b.text)
+        .join("\n")
+        .trim();
+      const cleaned = text.replace(/^```json\s*/i, "").replace(/^```\s*/, "").replace(/```\s*$/, "").trim();
+      const parsed = JSON.parse(cleaned);
+      if (skipped.length > 0) {
+        parsed.sections = [
+          ...(parsed.sections || []),
+          {
+            type: "bullets",
+            items: [`Couldn't read: ${skipped.join(", ")} (unsupported file type — only Google Docs, .txt, and .pdf are supported).`],
+          },
+        ];
+      }
+      setReport(parsed);
+    } catch (e) {
+      setBuildError(e.message || "Couldn't build the report. Please try again.");
+    } finally {
+      setBuilding(false);
+      setBuildProgress("");
+    }
+  }
+
+  async function handleDownloadReportDocx() {
+    if (!report) return;
+    const NAVY = "1B2A44";
+
+    const h1 = (t) =>
+      new Paragraph({ heading: HeadingLevel.HEADING_1, spacing: { before: 280, after: 140 }, children: [new TextRun({ text: t, bold: true, color: NAVY, size: 26 })] });
+    const bodyP = (t) => new Paragraph({ spacing: { after: 140 }, children: [new TextRun({ text: t, size: 21 })] });
+    const bullet = (t) => new Paragraph({ bullet: { level: 0 }, spacing: { after: 60 }, children: [new TextRun({ text: t, size: 21 })] });
+    const cell = (t, opts = {}) =>
+      new TableCell({
+        shading: opts.header ? { type: ShadingType.CLEAR, color: "auto", fill: NAVY } : undefined,
+        children: [new Paragraph({ children: [new TextRun({ text: String(t || ""), size: 18, bold: !!opts.header, color: opts.header ? "FFFFFF" : "000000" })] })],
+      });
+
+    const bodyChildren = [];
+    for (const s of report.sections || []) {
+      if (s.type === "heading") {
+        bodyChildren.push(h1(s.text || ""));
+      } else if (s.type === "paragraph") {
+        bodyChildren.push(bodyP(s.text || ""));
+      } else if (s.type === "bullets") {
+        for (const item of s.items || []) bodyChildren.push(bullet(item));
+      } else if (s.type === "table") {
+        const headers = s.headers || [];
+        const rows = s.rows || [];
+        bodyChildren.push(
+          new Table({
+            width: { size: 11000, type: WidthType.DXA },
+            rows: [
+              new TableRow({ children: headers.map((h) => cell(h, { header: true })) }),
+              ...rows.map((r) => new TableRow({ children: r.map((c) => cell(c)) })),
+            ],
+          })
+        );
+        bodyChildren.push(new Paragraph({ spacing: { after: 160 } }));
+      }
+    }
+
+    const doc = new Document({
+      sections: [
+        {
+          properties: { page: { size: { width: 16838, height: 11906 }, margin: { top: 900, bottom: 900, left: 900, right: 900 } } },
+          children: [
+            new Paragraph({ alignment: AlignmentType.CENTER, heading: HeadingLevel.TITLE, spacing: { after: 280 }, children: [new TextRun({ text: report.title || "Report", bold: true, color: NAVY, size: 34 })] }),
+            ...bodyChildren,
+          ],
+        },
+      ],
+    });
+
+    const blob = await Packer.toBlob(doc);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const safeName = (report.title || "Report").replace(/[\/\\?%*:|"<>]/g, "-");
+    a.href = url;
+    a.download = `${safeName}.docx`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  if (!clientId) {
+    return (
+      <div className="mx-auto max-w-lg rounded-lg border border-dashed py-16 text-center" style={{ borderColor: line, color: slate }}>
+        <FolderSearch size={26} className="mx-auto mb-3" style={{ color: slateLight }} />
+        <div style={{ fontSize: "14px", fontWeight: 600, color: ink }}>Drive Search isn't set up yet</div>
+        <p style={{ fontSize: "12.5px", marginTop: "6px", padding: "0 24px" }}>
+          Add a Google OAuth Client ID in Settings (top right) to enable searching your office Google Drive archive
+          by filename or content. See the README for setup steps.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div className="mb-5">
+        <h2 style={{ color: ink, fontFamily: "Inter", fontSize: "18px", fontWeight: 700 }}>Drive Search</h2>
+        <p style={{ color: slate, fontSize: "12.5px", marginTop: "2px" }}>
+          Search your office Google Drive archive by filename or content — including text inside OCR'd scans.
+        </p>
+      </div>
+
+      {!accessToken ? (
+        <div className="rounded-lg border bg-white p-6 text-center" style={{ borderColor: line }}>
+          <button
+            onClick={connect}
+            disabled={connecting || !scriptReady}
+            className="mx-auto flex items-center gap-2 rounded-md px-4 py-2.5 text-sm font-semibold text-white"
+            style={{ backgroundColor: ink, opacity: connecting || !scriptReady ? 0.7 : 1 }}
+          >
+            {connecting ? <Loader2 size={16} className="animate-spin" /> : <LogIn size={16} />}
+            {connecting ? "Connecting..." : "Connect Google Drive"}
+          </button>
+          {connectError && (
+            <div className="mt-3 flex items-center justify-center gap-1.5" style={{ color: maroon, fontSize: "12px" }}>
+              <AlertCircle size={13} /> {connectError}
+            </div>
+          )}
+          <p style={{ color: slateLight, fontSize: "11px", marginTop: "10px" }}>
+            You'll be asked to sign in with the Google account that owns your office Drive. Access is read-only and
+            the token stays only in this browser tab's memory.
+          </p>
+        </div>
+      ) : (
+        <>
+          <div className="mb-4 flex gap-1 rounded-md p-1" style={{ backgroundColor: "#EDE8DC", width: "fit-content" }}>
+            <button
+              onClick={() => setMode("search")}
+              className="rounded px-3 py-1.5 text-xs font-medium"
+              style={{ backgroundColor: mode === "search" ? "white" : "transparent", color: mode === "search" ? ink : slate, boxShadow: mode === "search" ? "0 1px 2px rgba(0,0,0,0.08)" : "none" }}
+            >
+              Search
+            </button>
+            <button
+              onClick={enterBrowseMode}
+              className="rounded px-3 py-1.5 text-xs font-medium"
+              style={{ backgroundColor: mode === "browse" ? "white" : "transparent", color: mode === "browse" ? ink : slate, boxShadow: mode === "browse" ? "0 1px 2px rgba(0,0,0,0.08)" : "none" }}
+            >
+              Browse Folders
+            </button>
+          </div>
+
+          {mode === "browse" && (
+            <div className="mb-4 rounded-lg border bg-white p-4" style={{ borderColor: line }}>
+              <div className="mb-3 flex flex-wrap items-center gap-1" style={{ fontSize: "12px" }}>
+                {browsePath.map((p, i) => (
+                  <React.Fragment key={p.id}>
+                    {i > 0 && <span style={{ color: slateLight }}>/</span>}
+                    <button
+                      onClick={() => navigateToBreadcrumb(i)}
+                      style={{ color: i === browsePath.length - 1 ? ink : brass, fontWeight: i === browsePath.length - 1 ? 600 : 400 }}
+                    >
+                      {p.name}
+                    </button>
+                  </React.Fragment>
+                ))}
+              </div>
+
+              {browseLoading ? (
+                <div className="flex items-center gap-2 py-8 justify-center" style={{ color: slate }}>
+                  <Loader2 size={16} className="animate-spin" /> Loading folder...
+                </div>
+              ) : (
+                <>
+                  {browseError && (
+                    <div className="mb-3 flex items-center gap-1.5" style={{ color: maroon, fontSize: "12px" }}>
+                      <AlertCircle size={13} /> {browseError}
+                    </div>
+                  )}
+
+                  {browseFiles.length > 0 && (
+                    <div className="mb-3 flex flex-wrap gap-2">
+                      <button
+                        onClick={handleSelectAllCurrentFolder}
+                        className="rounded-md border px-2.5 py-1.5 text-xs font-medium"
+                        style={{ borderColor: line, color: slate }}
+                      >
+                        Select all {browseFiles.length} file{browseFiles.length === 1 ? "" : "s"} here
+                      </button>
+                      <button
+                        onClick={handleSelectAllRecursive}
+                        disabled={recursiveLoading}
+                        className="flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium"
+                        style={{ borderColor: brass, color: brass, backgroundColor: "#FBF3E4", opacity: recursiveLoading ? 0.7 : 1 }}
+                      >
+                        {recursiveLoading ? <Loader2 size={12} className="animate-spin" /> : <FolderSearch size={12} />}
+                        {recursiveLoading ? recursiveProgress || "Scanning..." : "Select entire project (all subfolders)"}
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="space-y-1">
+                    {browseFolders.map((f) => (
+                      <button
+                        key={f.id}
+                        onClick={() => navigateInto(f)}
+                        className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-gray-50"
+                        style={{ color: charcoal }}
+                      >
+                        <BookOpen size={13} style={{ color: brass, flexShrink: 0 }} />
+                        {f.name}
+                      </button>
+                    ))}
+                    {browseFiles.map((f) => (
+                      <label key={f.id} className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-xs hover:bg-gray-50">
+                        <input type="checkbox" checked={selectedIds.has(f.id)} onChange={() => toggleBrowseFile(f)} />
+                        <FileText size={13} style={{ color: slateLight, flexShrink: 0 }} />
+                        <span style={{ color: charcoal }}>{f.name}</span>
+                      </label>
+                    ))}
+                    {!browseLoading && browseFolders.length === 0 && browseFiles.length === 0 && (
+                      <div style={{ color: slateLight, fontSize: "12px" }}>This folder is empty.</div>
+                    )}
+                  </div>
+                </>
+              )}
+
+              {selectedIds.size > 0 && (
+                <div className="mt-3 flex flex-wrap items-center gap-2 border-t pt-3" style={{ borderColor: line }}>
+                  <div style={{ color: slateLight, fontSize: "11.5px" }}>{selectedIds.size} file(s) selected overall</div>
+                  <select
+                    value={reportTypeId}
+                    onChange={(e) => setReportTypeId(e.target.value)}
+                    className="rounded-md border px-2.5 py-1.5 text-xs font-medium"
+                    style={{ borderColor: line, color: charcoal }}
+                  >
+                    {REPORT_TYPES.map((t) => (
+                      <option key={t.id} value={t.id}>
+                        {t.label}
+                      </option>
+                    ))}
+                    <option value="custom">Custom...</option>
+                  </select>
+                  {reportTypeId === "custom" && (
+                    <input
+                      value={customInstructions}
+                      onChange={(e) => setCustomInstructions(e.target.value)}
+                      placeholder="Describe the report you want..."
+                      className="min-w-[220px] flex-1 rounded-md border px-2.5 py-1.5 text-xs"
+                      style={{ borderColor: line }}
+                    />
+                  )}
+                  <button
+                    onClick={handleBuildReport}
+                    disabled={building}
+                    className="flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold text-white"
+                    style={{ backgroundColor: ink, opacity: building ? 0.7 : 1 }}
+                  >
+                    {building ? <Loader2 size={13} className="animate-spin" /> : <ListTree size={13} />}
+                    {building ? "Building..." : `Build Report (${selectedIds.size})`}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {mode === "search" && (
+          <>
+          <div className="mb-4 flex gap-2">
+            <div className="relative flex-1">
+              <Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2" style={{ color: slateLight }} />
+              <input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && handleSearch()}
+                placeholder="Search by filename, subject, clause, or any text..."
+                className="w-full rounded-md border py-2.5 pl-9 pr-3 text-sm outline-none"
+                style={{ borderColor: line, backgroundColor: "white" }}
+              />
+            </div>
+            <button
+              onClick={handleSearch}
+              disabled={searching || !query.trim()}
+              className="flex items-center gap-1.5 rounded-md px-4 py-2.5 text-sm font-medium text-white"
+              style={{ backgroundColor: ink, opacity: searching || !query.trim() ? 0.7 : 1 }}
+            >
+              {searching ? <Loader2 size={15} className="animate-spin" /> : <Search size={15} />}
+              Search
+            </button>
+          </div>
+
+          {searchError && (
+            <div className="mb-4 flex items-center gap-1.5 rounded-md border px-3 py-2" style={{ borderColor: maroon, color: maroon, fontSize: "12px" }}>
+              <AlertCircle size={13} /> {searchError}
+            </div>
+          )}
+
+          {searching ? (
+            <div className="flex items-center gap-2 py-12 justify-center" style={{ color: slate }}>
+              <Loader2 size={18} className="animate-spin" /> Searching your Drive...
+            </div>
+          ) : searched && results.length === 0 && !searchError ? (
+            <div className="rounded-lg border border-dashed py-12 text-center" style={{ borderColor: line, color: slate }}>
+              <div style={{ fontSize: "13px" }}>No files matched "{query}".</div>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {results.length > 0 && (
+                <div className="mb-1 space-y-2">
+                  <div style={{ color: slateLight, fontSize: "11.5px" }}>
+                    {selectedIds.size > 0 ? `${selectedIds.size} file(s) selected` : "Select files below to build a report from them"}
+                  </div>
+                  {selectedIds.size > 0 && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <select
+                        value={reportTypeId}
+                        onChange={(e) => setReportTypeId(e.target.value)}
+                        className="rounded-md border px-2.5 py-1.5 text-xs font-medium"
+                        style={{ borderColor: line, color: charcoal }}
+                      >
+                        {REPORT_TYPES.map((t) => (
+                          <option key={t.id} value={t.id}>
+                            {t.label}
+                          </option>
+                        ))}
+                        <option value="custom">Custom...</option>
+                      </select>
+                      {reportTypeId === "custom" && (
+                        <input
+                          value={customInstructions}
+                          onChange={(e) => setCustomInstructions(e.target.value)}
+                          placeholder="Describe the report you want..."
+                          className="min-w-[220px] flex-1 rounded-md border px-2.5 py-1.5 text-xs"
+                          style={{ borderColor: line }}
+                        />
+                      )}
+                      <button
+                        onClick={handleBuildReport}
+                        disabled={building}
+                        className="flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold text-white"
+                        style={{ backgroundColor: ink, opacity: building ? 0.7 : 1 }}
+                      >
+                        {building ? <Loader2 size={13} className="animate-spin" /> : <ListTree size={13} />}
+                        {building ? "Building..." : `Build Report (${selectedIds.size})`}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+              {results.map((file) => {
+                const isSelected = selectedIds.has(file.id);
+                return (
+                  <div
+                    key={file.id}
+                    className="rounded-lg border bg-white p-3.5 shadow-sm"
+                    style={{ borderColor: isSelected ? brass : line }}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex items-start gap-2.5">
+                        <button onClick={() => toggleSelect(file.id)} style={{ marginTop: "1px", flexShrink: 0, color: isSelected ? brass : slateLight }}>
+                          {isSelected ? <CheckSquare size={16} /> : <Square size={16} />}
+                        </button>
+                        <FileText size={16} style={{ color: brass, marginTop: "1px", flexShrink: 0 }} />
+                        <div>
+                          <div style={{ fontWeight: 600, color: ink, fontSize: "13px" }}>{file.name}</div>
+                          <div style={{ color: slateLight, fontSize: "11px", marginTop: "1px" }}>
+                            Modified {formatDate(file.modifiedTime)}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="flex flex-shrink-0 gap-1.5">
+                        <button
+                          onClick={() => handlePreview(file)}
+                          className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs font-medium"
+                          style={{ borderColor: line, color: slate }}
+                        >
+                          <Clipboard size={11} /> Preview
+                        </button>
+                        <a
+                          href={file.webViewLink}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs font-medium"
+                          style={{ borderColor: line, color: slate }}
+                        >
+                          <ExternalLink size={11} /> Open
+                        </a>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          </>
+          )}
+
+          {building && (
+            <div className="mt-4 flex items-center gap-2 rounded-md border px-3 py-2.5" style={{ borderColor: brass, backgroundColor: "#FBF3E4" }}>
+              <Loader2 size={14} className="animate-spin" style={{ color: brass }} />
+              <span style={{ color: brass, fontSize: "12.5px" }}>{buildProgress || "Working..."}</span>
+            </div>
+          )}
+          {buildError && (
+            <div className="mt-4 flex items-center gap-1.5 rounded-md border px-3 py-2" style={{ borderColor: maroon, color: maroon, fontSize: "12px" }}>
+              <AlertCircle size={13} /> {buildError}
+            </div>
+          )}
+
+          {report && (
+            <div className="mt-6 rounded-lg border bg-white p-5 shadow-sm" style={{ borderColor: line }}>
+              <div className="mb-3 flex items-center justify-between">
+                <h3 style={{ color: ink, fontWeight: 700, fontSize: "15px" }}>{report.title}</h3>
+                <button
+                  onClick={handleDownloadReportDocx}
+                  className="flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium text-white"
+                  style={{ backgroundColor: brass }}
+                >
+                  <Download size={12} /> Download .docx
+                </button>
+              </div>
+
+              {(report.sections || []).map((s, idx) => {
+                if (s.type === "heading") {
+                  return (
+                    <div key={idx} style={{ color: brass, fontSize: "11px", fontWeight: 700, textTransform: "uppercase", marginTop: idx === 0 ? 0 : "16px" }}>
+                      {s.text}
+                    </div>
+                  );
+                }
+                if (s.type === "paragraph") {
+                  return (
+                    <p key={idx} style={{ fontSize: "12.5px", color: charcoal, marginTop: "6px", lineHeight: 1.6 }}>
+                      {s.text}
+                    </p>
+                  );
+                }
+                if (s.type === "bullets") {
+                  return (
+                    <ul key={idx} className="mt-1.5 list-disc pl-4" style={{ fontSize: "12.5px", color: charcoal, lineHeight: 1.6 }}>
+                      {(s.items || []).map((item, i) => (
+                        <li key={i}>{item}</li>
+                      ))}
+                    </ul>
+                  );
+                }
+                if (s.type === "table") {
+                  return (
+                    <div key={idx} className="mt-2 overflow-x-auto">
+                      <table className="w-full text-xs" style={{ borderCollapse: "collapse" }}>
+                        <thead>
+                          <tr style={{ backgroundColor: ink }}>
+                            {(s.headers || []).map((h, i) => (
+                              <th key={i} className="px-2 py-1.5 text-left" style={{ color: "white" }}>
+                                {h}
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(s.rows || []).map((r, i) => (
+                            <tr key={i} style={{ backgroundColor: i % 2 === 0 ? "white" : "#FAFAF8", borderBottom: `1px solid ${line}` }}>
+                              {r.map((c, j) => (
+                                <td key={j} className="px-2 py-1.5 align-top" style={{ color: j === 0 ? charcoal : slateLight }}>
+                                  {c}
+                                </td>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  );
+                }
+                return null;
+              })}
+            </div>
+          )}
+        </>
+      )}
+
+      {previewFile && (
+        <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/40 p-4" onClick={() => setPreviewFile(null)}>
+          <div
+            className="max-h-[80vh] w-full max-w-xl overflow-y-auto rounded-lg bg-white p-5 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-3 flex items-center justify-between">
+              <h3 style={{ color: ink, fontWeight: 700, fontSize: "14px" }}>{previewFile.name}</h3>
+              <button onClick={() => setPreviewFile(null)} style={{ color: slateLight }}>
+                <X size={18} />
+              </button>
+            </div>
+            {previewLoading ? (
+              <div className="flex items-center gap-2 py-10 justify-center" style={{ color: slate }}>
+                <Loader2 size={16} className="animate-spin" /> Loading content...
+              </div>
+            ) : previewError ? (
+              <div className="flex items-center gap-1.5" style={{ color: maroon, fontSize: "12.5px" }}>
+                <AlertCircle size={13} /> {previewError}
+              </div>
+            ) : (
+              <>
+                <div
+                  className="max-h-96 overflow-y-auto rounded-md p-3 text-sm"
+                  style={{ backgroundColor: parchment, fontFamily: "Tinos", whiteSpace: "pre-wrap" }}
+                >
+                  {previewText}
+                </div>
+                <button
+                  onClick={handleCopyPreview}
+                  className="mt-3 flex items-center gap-1.5 rounded-md px-3.5 py-2 text-sm font-medium text-white"
+                  style={{ backgroundColor: previewCopied ? "#3E7D52" : brass }}
+                >
+                  {previewCopied ? <Check size={14} /> : <Copy size={14} />}
+                  {previewCopied ? "Copied" : "Copy text"}
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
