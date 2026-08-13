@@ -1,4 +1,4 @@
- import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   BookOpen,
   FileText,
@@ -37,14 +37,38 @@ import {
   Packer,
   PageBreak,
 } from "docx";
-import * as pdfjsLib from "pdfjs-dist";
-import pdfjsWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
-import * as mammoth from "mammoth";
-import { createWorker } from "tesseract.js";
-import JSZip from "jszip";
-import { jsPDF } from "jspdf";
+// The following libraries are heavy and known for occasional bundler
+// interop quirks — they're loaded lazily (only when actually used) instead
+// of at startup, so a problem in any one of them can't break the whole app
+// on load; it would only affect the specific feature that needs it.
+let _pdfjs = null;
+async function getPdfjs() {
+  if (_pdfjs) return _pdfjs;
+  const lib = await import("pdfjs-dist");
+  const workerModule = await import("pdfjs-dist/build/pdf.worker.min.mjs?url");
+  lib.GlobalWorkerOptions.workerSrc = workerModule.default;
+  _pdfjs = lib;
+  return lib;
+}
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
+async function getMammoth() {
+  return await import("mammoth");
+}
+
+async function getTesseractCreateWorker() {
+  const mod = await import("tesseract.js");
+  return mod.createWorker;
+}
+
+async function getJSZip() {
+  const mod = await import("jszip");
+  return mod.default;
+}
+
+async function getJsPDFClass() {
+  const mod = await import("jspdf");
+  return mod.jsPDF;
+}
 
 // ---------------------------------------------------------------------------
 // Extract text from a locally-selected file (not from Drive — from the
@@ -60,12 +84,14 @@ async function extractTextFromLocalFile(file, onProgress) {
 
   if (name.endsWith(".docx")) {
     const arrayBuffer = await file.arrayBuffer();
+    const mammoth = await getMammoth();
     const result = await mammoth.extractRawText({ arrayBuffer });
     return result.value.trim();
   }
 
   if (name.endsWith(".pdf")) {
     const arrayBuffer = await file.arrayBuffer();
+    const pdfjsLib = await getPdfjs();
     const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
     let text = "";
     const maxPages = Math.min(pdf.numPages, 20);
@@ -80,6 +106,7 @@ async function extractTextFromLocalFile(file, onProgress) {
 
   if (name.endsWith(".jpg") || name.endsWith(".jpeg") || name.endsWith(".png") || name.endsWith(".webp")) {
     if (onProgress) onProgress("Running OCR on image (this can take a moment)...");
+    const createWorker = await getTesseractCreateWorker();
     const worker = await createWorker("eng");
     try {
       const {
@@ -1457,6 +1484,7 @@ ${toneNote}
         return;
       }
 
+      const JSZip = await getJSZip();
       const zip = new JSZip();
       zip.file(`${safeName}.docx`, letterBlob);
 
@@ -2162,6 +2190,7 @@ async function extractTextFromDriveFile(file, accessToken) {
     });
     if (!res.ok) throw new Error("download failed");
     const arrayBuffer = await res.arrayBuffer();
+    const pdfjsLib = await getPdfjs();
     const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
     let text = "";
     const maxPages = Math.min(pdf.numPages, 15);
@@ -2273,6 +2302,7 @@ async function fetchDriveRefAsPdfBytes(entry, accessToken) {
   // Plain text/markdown — no native PDF form, so generate a simple one from
   // the text we already extracted.
   if (entry.text) {
+    const jsPDF = await getJsPDFClass();
     const pdf = new jsPDF({ unit: "pt", format: "a4" });
     const margin = 48;
     const maxWidth = 595 - margin * 2;
@@ -2326,30 +2356,4 @@ async function buildLetterDocxBlob(draftText, letterheadType) {
     (line) =>
       new Paragraph({
         spacing: { after: line.trim() === "" ? 120 : 40 },
-        children: [new TextRun({ text: line, size: 22 })],
-      })
-  );
-
-  const doc = new Document({
-    sections: [
-      {
-        properties: { page: { margin: { top: 900, bottom: 900, left: 1000, right: 1000 } } },
-        children: [
-          ...headerParagraphs,
-          new Paragraph({ border: { bottom: { color: BRASS, space: 4, style: "single", size: 8 } }, spacing: { after: 240 } }),
-          ...bodyParagraphs,
-        ],
-      },
-    ],
-  });
-
-  return await Packer.toBlob(doc);
-}
-
-// ---------------------------------------------------------------------------
-// Report Builder — one flexible engine behind several report types.
-// Each type just changes the instructions given to Claude; the output shape
-// (a list of sections: heading / paragraph / bullets / table) is always the
-// same, so one renderer and one docx exporter handle every report type.
-// ---------------------------------------------------------------------------
-c               
+        children: [new TextRun({ text: line, size: 2
